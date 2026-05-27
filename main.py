@@ -3,6 +3,10 @@ from fastapi.middleware.cors import CORSMiddleware
 import yfinance as yf
 from datetime import datetime, timezone
 import time
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="S&P 500 Sector Heatmap API", version="1.0.0")
 
@@ -36,31 +40,52 @@ def safe_round(val, digits=2):
 def get_ticker_data(symbol: str) -> dict:
     t = yf.Ticker(symbol)
 
+    # Try .info first
     info = {}
     try:
         info = t.info
-    except Exception:
-        pass
+        logger.info(f"{symbol} info keys: {list(info.keys())[:10]}")
+        logger.info(f"{symbol} currentPrice={info.get('currentPrice')} regularMarketPrice={info.get('regularMarketPrice')}")
+    except Exception as e:
+        logger.error(f"{symbol} .info error: {e}")
 
-    # Calculate YTD from price history (most reliable)
+    # Try fast_info as fallback
+    fi_price = None
+    fi_ytd   = None
+    fi_high  = None
+    fi_low   = None
+    try:
+        fi = t.fast_info
+        fi_price = fi.get("lastPrice") or fi.get("last_price")
+        fi_ytd   = fi.get("ytdReturn") or fi.get("ytd_return")
+        fi_high  = fi.get("fiftyTwoWeekHigh") or fi.get("fifty_two_week_high")
+        fi_low   = fi.get("fiftyTwoWeekLow")  or fi.get("fifty_two_week_low")
+        logger.info(f"{symbol} fast_info: price={fi_price} ytd={fi_ytd}")
+    except Exception as e:
+        logger.error(f"{symbol} fast_info error: {e}")
+
+    # Try history for YTD calculation
     ytd_pct = None
     try:
-        raw_ytd = info.get("ytdReturn")
-        if raw_ytd and raw_ytd != 0:
-            ytd_pct = safe_round(float(raw_ytd) * 100)
+        if fi_ytd and fi_ytd != 0:
+            ytd_pct = safe_round(float(fi_ytd) * 100)
         else:
             hist = t.history(period="ytd", interval="1d")
+            logger.info(f"{symbol} history rows: {len(hist)}")
             if not hist.empty and len(hist) >= 2:
                 first = float(hist["Close"].iloc[0])
                 last  = float(hist["Close"].iloc[-1])
                 if first > 0:
                     ytd_pct = safe_round((last - first) / first * 100)
-    except Exception:
-        pass
+                    logger.info(f"{symbol} YTD from history: {ytd_pct}%")
+    except Exception as e:
+        logger.error(f"{symbol} history error: {e}")
 
-    price   = (info.get("currentPrice")
-               or info.get("regularMarketPrice")
-               or info.get("navPrice"))
+    price = (info.get("currentPrice")
+             or info.get("regularMarketPrice")
+             or info.get("navPrice")
+             or fi_price)
+
     div_raw = (info.get("dividendYield")
                or info.get("trailingAnnualDividendYield")
                or 0)
@@ -69,8 +94,8 @@ def get_ticker_data(symbol: str) -> dict:
         "price":    safe_round(price),
         "change1d": safe_round(info.get("regularMarketChangePercent")),
         "ytd":      ytd_pct,
-        "high52":   safe_round(info.get("fiftyTwoWeekHigh")),
-        "low52":    safe_round(info.get("fiftyTwoWeekLow")),
+        "high52":   safe_round(info.get("fiftyTwoWeekHigh") or fi_high),
+        "low52":    safe_round(info.get("fiftyTwoWeekLow")  or fi_low),
         "pe":       safe_round(info.get("forwardPE") or info.get("trailingPE")),
         "divYield": safe_round(float(div_raw) * 100) if div_raw else None,
         "volume":   info.get("averageVolume"),
@@ -80,6 +105,36 @@ def get_ticker_data(symbol: str) -> dict:
 @app.get("/")
 def root():
     return {"status": "ok", "time": datetime.now(timezone.utc).isoformat()}
+
+
+@app.get("/debug/{ticker}")
+def debug_ticker(ticker: str):
+    """Debug endpoint — shows raw yfinance output for a single ticker."""
+    ticker = ticker.upper()
+    t = yf.Ticker(ticker)
+    result = {"ticker": ticker}
+
+    try:
+        info = t.info
+        result["info_sample"] = {k: info[k] for k in list(info.keys())[:20]}
+    except Exception as e:
+        result["info_error"] = str(e)
+
+    try:
+        fi = t.fast_info
+        result["fast_info"] = dict(fi)
+    except Exception as e:
+        result["fast_info_error"] = str(e)
+
+    try:
+        hist = t.history(period="5d", interval="1d")
+        result["history_rows"] = len(hist)
+        if not hist.empty:
+            result["last_close"] = float(hist["Close"].iloc[-1])
+    except Exception as e:
+        result["history_error"] = str(e)
+
+    return result
 
 
 @app.get("/sectors")
