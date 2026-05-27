@@ -4,9 +4,25 @@ import yfinance as yf
 from datetime import datetime, timezone
 import time
 import logging
+import requests
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ── Patch yfinance session with browser-like headers ────────────────
+session = requests.Session()
+session.headers.update({
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept":          "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Referer":         "https://finance.yahoo.com/",
+    "Origin":          "https://finance.yahoo.com",
+})
 
 app = FastAPI(title="S&P 500 Sector Heatmap API", version="1.0.0")
 
@@ -37,55 +53,39 @@ def safe_round(val, digits=2):
     except (TypeError, ValueError):
         return None
 
-def get_ticker_data(symbol: str) -> dict:
-    t = yf.Ticker(symbol)
+def make_ticker(symbol: str) -> yf.Ticker:
+    """Create a yfinance Ticker with a browser-like session."""
+    return yf.Ticker(symbol, session=session)
 
-    # Try .info first
+def get_ticker_data(symbol: str) -> dict:
+    t = make_ticker(symbol)
+
     info = {}
     try:
         info = t.info
-        logger.info(f"{symbol} info keys: {list(info.keys())[:10]}")
-        logger.info(f"{symbol} currentPrice={info.get('currentPrice')} regularMarketPrice={info.get('regularMarketPrice')}")
+        logger.info(f"{symbol}: price={info.get('currentPrice')} ytd={info.get('ytdReturn')}")
     except Exception as e:
         logger.error(f"{symbol} .info error: {e}")
 
-    # Try fast_info as fallback
-    fi_price = None
-    fi_ytd   = None
-    fi_high  = None
-    fi_low   = None
-    try:
-        fi = t.fast_info
-        fi_price = fi.get("lastPrice") or fi.get("last_price")
-        fi_ytd   = fi.get("ytdReturn") or fi.get("ytd_return")
-        fi_high  = fi.get("fiftyTwoWeekHigh") or fi.get("fifty_two_week_high")
-        fi_low   = fi.get("fiftyTwoWeekLow")  or fi.get("fifty_two_week_low")
-        logger.info(f"{symbol} fast_info: price={fi_price} ytd={fi_ytd}")
-    except Exception as e:
-        logger.error(f"{symbol} fast_info error: {e}")
-
-    # Try history for YTD calculation
+    # YTD from history (most reliable)
     ytd_pct = None
     try:
-        if fi_ytd and fi_ytd != 0:
-            ytd_pct = safe_round(float(fi_ytd) * 100)
+        raw_ytd = info.get("ytdReturn")
+        if raw_ytd:
+            ytd_pct = safe_round(float(raw_ytd) * 100)
         else:
             hist = t.history(period="ytd", interval="1d")
-            logger.info(f"{symbol} history rows: {len(hist)}")
             if not hist.empty and len(hist) >= 2:
                 first = float(hist["Close"].iloc[0])
                 last  = float(hist["Close"].iloc[-1])
                 if first > 0:
                     ytd_pct = safe_round((last - first) / first * 100)
-                    logger.info(f"{symbol} YTD from history: {ytd_pct}%")
     except Exception as e:
-        logger.error(f"{symbol} history error: {e}")
+        logger.error(f"{symbol} ytd error: {e}")
 
-    price = (info.get("currentPrice")
-             or info.get("regularMarketPrice")
-             or info.get("navPrice")
-             or fi_price)
-
+    price   = (info.get("currentPrice")
+               or info.get("regularMarketPrice")
+               or info.get("navPrice"))
     div_raw = (info.get("dividendYield")
                or info.get("trailingAnnualDividendYield")
                or 0)
@@ -94,8 +94,8 @@ def get_ticker_data(symbol: str) -> dict:
         "price":    safe_round(price),
         "change1d": safe_round(info.get("regularMarketChangePercent")),
         "ytd":      ytd_pct,
-        "high52":   safe_round(info.get("fiftyTwoWeekHigh") or fi_high),
-        "low52":    safe_round(info.get("fiftyTwoWeekLow")  or fi_low),
+        "high52":   safe_round(info.get("fiftyTwoWeekHigh")),
+        "low52":    safe_round(info.get("fiftyTwoWeekLow")),
         "pe":       safe_round(info.get("forwardPE") or info.get("trailingPE")),
         "divYield": safe_round(float(div_raw) * 100) if div_raw else None,
         "volume":   info.get("averageVolume"),
@@ -109,23 +109,18 @@ def root():
 
 @app.get("/debug/{ticker}")
 def debug_ticker(ticker: str):
-    """Debug endpoint — shows raw yfinance output for a single ticker."""
+    """Shows raw yfinance output for a single ticker."""
     ticker = ticker.upper()
-    t = yf.Ticker(ticker)
+    t = make_ticker(ticker)
     result = {"ticker": ticker}
-
     try:
         info = t.info
         result["info_sample"] = {k: info[k] for k in list(info.keys())[:20]}
+        result["price"]  = info.get("currentPrice") or info.get("regularMarketPrice")
+        result["ytd"]    = info.get("ytdReturn")
+        result["high52"] = info.get("fiftyTwoWeekHigh")
     except Exception as e:
         result["info_error"] = str(e)
-
-    try:
-        fi = t.fast_info
-        result["fast_info"] = dict(fi)
-    except Exception as e:
-        result["fast_info_error"] = str(e)
-
     try:
         hist = t.history(period="5d", interval="1d")
         result["history_rows"] = len(hist)
@@ -133,7 +128,6 @@ def debug_ticker(ticker: str):
             result["last_close"] = float(hist["Close"].iloc[-1])
     except Exception as e:
         result["history_error"] = str(e)
-
     return result
 
 
@@ -193,16 +187,14 @@ def get_history(ticker: str, period: str = "ytd", interval: str = "1d"):
     cached = cache_get(key, ttl=300)
     if cached:
         return cached
-
     valid_periods   = {"1d","5d","1mo","3mo","6mo","ytd","1y","2y","5y","10y","max"}
     valid_intervals = {"1m","5m","15m","30m","1h","1d","1wk","1mo"}
     if period not in valid_periods:
         raise HTTPException(status_code=400, detail=f"Invalid period. Use: {valid_periods}")
     if interval not in valid_intervals:
         raise HTTPException(status_code=400, detail=f"Invalid interval. Use: {valid_intervals}")
-
     try:
-        t = yf.Ticker(ticker)
+        t = make_ticker(ticker)
         hist = t.history(period=period, interval=interval)
         if hist.empty:
             raise HTTPException(status_code=404, detail=f"No data for {ticker}")
@@ -234,10 +226,8 @@ def get_market_data():
     cached = cache_get("market-data", ttl=60)
     if cached:
         return cached
-
     sectors_data = get_sectors()
     indices_data = get_indices()
-
     quotes = {}
     for ticker, d in sectors_data["quotes"].items():
         quotes[ticker] = {
@@ -251,7 +241,6 @@ def get_market_data():
         }
     for name, d in indices_data["quotes"].items():
         quotes[name] = d
-
     out = {
         "success": True,
         "quotes": quotes,
