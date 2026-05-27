@@ -2,8 +2,6 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import yfinance as yf
 from datetime import datetime, timezone
-import asyncio
-from functools import lru_cache
 import time
 
 app = FastAPI(title="S&P 500 Sector Heatmap API", version="1.0.0")
@@ -15,11 +13,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Ticker constants ────────────────────────────────────────────────
 SECTOR_TICKERS = ["XLK","XLF","XLC","XLY","XLV","XLI","XLP","XLE","XLRE","XLB","XLU"]
-INDEX_TICKERS  = {"SPY": "^GSPC", "QQQ": "^NDX", "IWM": "^RUT"}
+INDEX_TICKERS  = {"SPY": "SPY", "QQQ": "QQQ", "IWM": "IWM"}
 
-# ── Simple in-memory cache (TTL 60s for quotes) ─────────────────────
 _cache: dict = {}
 
 def cache_get(key: str, ttl: int = 60):
@@ -31,7 +27,6 @@ def cache_get(key: str, ttl: int = 60):
 def cache_set(key: str, data):
     _cache[key] = {"data": data, "ts": time.time()}
 
-# ── Helpers ─────────────────────────────────────────────────────────
 def safe_round(val, digits=2):
     try:
         return round(float(val), digits)
@@ -40,25 +35,47 @@ def safe_round(val, digits=2):
 
 def get_ticker_data(symbol: str) -> dict:
     t = yf.Ticker(symbol)
-    fi = t.fast_info
+
     info = {}
     try:
         info = t.info
     except Exception:
         pass
 
+    # Calculate YTD from price history (most reliable)
+    ytd_pct = None
+    try:
+        raw_ytd = info.get("ytdReturn")
+        if raw_ytd and raw_ytd != 0:
+            ytd_pct = safe_round(float(raw_ytd) * 100)
+        else:
+            hist = t.history(period="ytd", interval="1d")
+            if not hist.empty and len(hist) >= 2:
+                first = float(hist["Close"].iloc[0])
+                last  = float(hist["Close"].iloc[-1])
+                if first > 0:
+                    ytd_pct = safe_round((last - first) / first * 100)
+    except Exception:
+        pass
+
+    price   = (info.get("currentPrice")
+               or info.get("regularMarketPrice")
+               or info.get("navPrice"))
+    div_raw = (info.get("dividendYield")
+               or info.get("trailingAnnualDividendYield")
+               or 0)
+
     return {
-        "price":    safe_round(fi.get("lastPrice")),
-        "change1d": safe_round(fi.get("regularMarketChangePercent")),
-        "ytd":      safe_round((fi.get("ytdReturn") or 0) * 100),
-        "high52":   safe_round(fi.get("fiftyTwoWeekHigh")),
-        "low52":    safe_round(fi.get("fiftyTwoWeekLow")),
-        "pe":       safe_round(info.get("forwardPE")),
-        "divYield": safe_round((info.get("dividendYield") or 0) * 100),
-        "volume":   fi.get("threeMonthAverageVolume"),
+        "price":    safe_round(price),
+        "change1d": safe_round(info.get("regularMarketChangePercent")),
+        "ytd":      ytd_pct,
+        "high52":   safe_round(info.get("fiftyTwoWeekHigh")),
+        "low52":    safe_round(info.get("fiftyTwoWeekLow")),
+        "pe":       safe_round(info.get("forwardPE") or info.get("trailingPE")),
+        "divYield": safe_round(float(div_raw) * 100) if div_raw else None,
+        "volume":   info.get("averageVolume"),
     }
 
-# ── Routes ───────────────────────────────────────────────────────────
 
 @app.get("/")
 def root():
@@ -67,18 +84,15 @@ def root():
 
 @app.get("/sectors")
 def get_sectors():
-    """Live data for all 11 S&P 500 sector ETFs."""
     cached = cache_get("sectors", ttl=60)
     if cached:
         return cached
-
     result = {}
     for ticker in SECTOR_TICKERS:
         try:
             result[ticker] = get_ticker_data(ticker)
         except Exception as e:
             result[ticker] = {"error": str(e)}
-
     out = {"quotes": result, "updated_at": datetime.now(timezone.utc).isoformat()}
     cache_set("sectors", out)
     return out
@@ -86,24 +100,15 @@ def get_sectors():
 
 @app.get("/indices")
 def get_indices():
-    """Live data for SPY/QQQ/IWM as index proxies."""
     cached = cache_get("indices", ttl=60)
     if cached:
         return cached
-
     result = {}
     for name, sym in INDEX_TICKERS.items():
         try:
-            t = yf.Ticker(sym)
-            fi = t.fast_info
-            result[name] = {
-                "price":    safe_round(fi.get("lastPrice")),
-                "ytd":      safe_round((fi.get("ytdReturn") or 0) * 100),
-                "change1d": safe_round(fi.get("regularMarketChangePercent")),
-            }
+            result[name] = get_ticker_data(sym)
         except Exception as e:
             result[name] = {"error": str(e)}
-
     out = {"quotes": result, "updated_at": datetime.now(timezone.utc).isoformat()}
     cache_set("indices", out)
     return out
@@ -111,13 +116,11 @@ def get_indices():
 
 @app.get("/quote/{ticker}")
 def get_quote(ticker: str):
-    """Single ticker quote — price, ytd, pe, yield, 52w range."""
     ticker = ticker.upper()
     key = f"quote:{ticker}"
     cached = cache_get(key, ttl=60)
     if cached:
         return cached
-
     try:
         data = get_ticker_data(ticker)
         data["ticker"] = ticker
@@ -130,7 +133,6 @@ def get_quote(ticker: str):
 
 @app.get("/history/{ticker}")
 def get_history(ticker: str, period: str = "ytd", interval: str = "1d"):
-    """OHLCV history for a ticker. period: 1d,5d,1mo,3mo,6mo,ytd,1y,2y,5y,10y,max"""
     ticker = ticker.upper()
     key = f"history:{ticker}:{period}:{interval}"
     cached = cache_get(key, ttl=300)
@@ -149,7 +151,6 @@ def get_history(ticker: str, period: str = "ytd", interval: str = "1d"):
         hist = t.history(period=period, interval=interval)
         if hist.empty:
             raise HTTPException(status_code=404, detail=f"No data for {ticker}")
-
         records = []
         for ts, row in hist.iterrows():
             records.append({
@@ -160,13 +161,9 @@ def get_history(ticker: str, period: str = "ytd", interval: str = "1d"):
                 "close":  safe_round(row.get("Close")),
                 "volume": int(row.get("Volume", 0)),
             })
-
         out = {
-            "ticker": ticker,
-            "period": period,
-            "interval": interval,
-            "count": len(records),
-            "data": records,
+            "ticker": ticker, "period": period, "interval": interval,
+            "count": len(records), "data": records,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
         cache_set(key, out)
@@ -179,33 +176,30 @@ def get_history(ticker: str, period: str = "ytd", interval: str = "1d"):
 
 @app.get("/market-data")
 def get_market_data():
-    """Combined endpoint: sectors + indices in one call (used by heatmap)."""
     cached = cache_get("market-data", ttl=60)
     if cached:
         return cached
 
-    sectors_data  = get_sectors()
-    indices_data  = get_indices()
+    sectors_data = get_sectors()
+    indices_data = get_indices()
 
-    # Map to the format the heatmap JS already expects
     quotes = {}
     for ticker, d in sectors_data["quotes"].items():
         quotes[ticker] = {
-            "ytd":      d.get("ytd", 0),
-            "price":    d.get("price", 0),
-            "high52":   d.get("high52", 0),
-            "low52":    d.get("low52", 0),
-            "pe":       d.get("pe", 0),
-            "divYield": d.get("divYield", 0),
+            "ytd":      d.get("ytd"),
+            "price":    d.get("price"),
+            "high52":   d.get("high52"),
+            "low52":    d.get("low52"),
+            "pe":       d.get("pe"),
+            "divYield": d.get("divYield"),
+            "change1d": d.get("change1d"),
         }
-
-    # Add index proxies
     for name, d in indices_data["quotes"].items():
         quotes[name] = d
 
     out = {
         "success": True,
-        "quotes":  quotes,
+        "quotes": quotes,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     cache_set("market-data", out)
